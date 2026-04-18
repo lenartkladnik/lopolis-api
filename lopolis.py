@@ -29,6 +29,8 @@ class LoginError(Exception):...
 class API:
     def __init__(self, session: Session) -> None:
         self.session = session
+        self._next_action_script_pos = {"timetable": 13, "meals": 15, "unset_meals": 15, "evaluations": 13}
+        self._next_action_in_file_pos = {"timetable": 0, "meals": 2, "unset_meals": 0, "evaluations": 0}
 
     def _request(self, path: str) -> Any:
         """
@@ -40,15 +42,52 @@ class API:
     def _format_date(self, date: datetime) -> str:
         return date.strftime("%Y-%m-%d")
 
-    def _parse_next_js_action_response(self, data: str) -> dict[int, Any]:
+    def _parse_next_js_action_response(self, data: str, parse_json: bool = True) -> dict[int, Any]:
         res = {}
 
-        for line in data.splitlines():
-            id, val = line.split(':', 1)
+        parts = re.split(r'(\d+):(I?\{|I?\[|")', data)[1:]
 
-            res.update({int(id): json.loads(val)})
+        for i in range(0, len(parts), 3):
+            id = int(parts[i])
+            val = parts[i + 1] + parts[i + 2].strip()
+
+            res.update({int(id): (json.loads(val) if parse_json else val)})
 
         return res
+
+    def _get_next_action(self, path: str, id: str | None = None):
+        if not id:
+            id = path.strip()[1:]
+
+        raw_timetable_data = self.session.request(path, text=True)
+        chunk = None
+        next_action = ""
+
+        c = 0
+        for i in re.findall(r'script src="\/_next\/static\/chunks\/(.{13})', str(raw_timetable_data).replace("\\n", "\n")):
+            if c == self._next_action_script_pos[id]:
+                chunk = i
+                break
+
+            c += 1
+
+        if chunk:
+            c = 0
+            for j in re.findall(r'[a-f0-9]{42}', str(self.session.request(f"/_next/static/chunks/{chunk}.js", text=True))):
+                if c == self._next_action_in_file_pos[id]:
+                    next_action = j
+                    break
+
+                c += 1
+
+        return next_action
+
+    def _get_next_router_state_tree(self, path: str):
+        next_header_data = self.session.request(path, headers={"rsc": 1, "next-router-prefetch": 1, "next-url": path}, text=True)
+        next_router_state_tree = json.loads(self.session.api._parse_next_js_action_response(str(next_header_data), parse_json=False)[0])['f'][0][0]
+        next_router_state_tree[:] = [x if x != '$undefined' else 'null' for x in next_router_state_tree] # Replace all $undefined with null
+
+        return urllib.parse.quote_plus(json.dumps(next_router_state_tree))
 
     def get_chat_unread_count(self) -> Any:
         return self._request("/api/chat_unread_count")
@@ -56,8 +95,8 @@ class API:
     def get_evaluations(self) -> Any:
         # These headers encode the next js action, so the server knows to respond with the raw data and not the html page
         headers = {
-            "next-action": "00280c5ca79aba50e6f29e80000287ccb47b74e15b",
-            "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(root)%22%2C%7B%22children%22%3A%5B%22(routes)%22%2C%7B%22children%22%3A%5B%22evaluations%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C20%5D"
+            "next-action": self._get_next_action("/evaluations"),
+            "next-router-state-tree": self._get_next_router_state_tree("/evaluations")
         }
         r = self.session.request("/evaluations", method="POST", headers=headers, text=True)
 
@@ -72,9 +111,10 @@ class API:
     def get_timetable(self, date: datetime = datetime.today()) -> Any:
         # These headers encode the next js action, so the server knows to respond with the raw data and not the html page
         headers = {
-            "next-action": "40d832d89cdb8b9a476c8777e457f4e091f991fced",
-            "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(root)%22%2C%7B%22children%22%3A%5B%22(routes)%22%2C%7B%22children%22%3A%5B%22timetable%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C4%5D%7D%2Cnull%2Cnull%2C8%5D%7D%2Cnull%2Cnull%2C8%5D%7D%2Cnull%2Cnull%2C28%5D"
+            "next-action": self._get_next_action("/timetable"),
+            "next-router-state-tree": self._get_next_router_state_tree("/timetable")
         }
+
         r = self.session.request("/timetable", data=[self._format_date(date)], method="POST", headers=headers, text=True)
 
         return self._parse_next_js_action_response(str(r))[1]
@@ -87,11 +127,23 @@ class API:
 
         # These headers encode the next js action, so the server knows to respond with the raw data and not the html page
         headers = {
-            "next-action": "4094cff75d4086106e44bc01e55f8848688b1b1107",
-            "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(root)%22%2C%7B%22children%22%3A%5B%22(routes)%22%2C%7B%22children%22%3A%5B%22meals%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C20%5D"
+            "next-action": self._get_next_action("/meals"),
+            "next-router-state-tree": self._get_next_router_state_tree("/meals")
         }
 
         r = self.session.request(f"/meals?date={strdate}", data=[{"type": meal_type, "date": strdate, "menu": meal_id}], method="POST", headers=headers, text=True)
+
+        return self._parse_next_js_action_response(str(r))[1]
+
+    def unset_meals_menu(self, date: datetime, meal_type = "afternoon_snack") -> Any:
+        strdate = self._format_date(date)
+
+        headers = {
+            "next-action": self._get_next_action("/meals", "unset_meals"),
+            "next-router-state-tree": self._get_next_router_state_tree("/meals")
+        }
+
+        r = self.session.request(f"/meals?date={strdate}", data=[{"type": meal_type, "date": strdate}], method="POST", headers=headers, text=True)
 
         return self._parse_next_js_action_response(str(r))[1]
 
